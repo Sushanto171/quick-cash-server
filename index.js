@@ -9,7 +9,12 @@ const app = express();
 const port = process.env.PROT || 5000;
 
 // middleware
-app.use(cors());
+app.use(
+  cors({
+    origin: ["http://localhost:5173"],
+    credentials: true,
+  })
+);
 app.use(express.json());
 
 // db connection
@@ -51,6 +56,31 @@ const tokenGenerate = (user) => {
   return token;
 };
 
+// Verify token
+const verifyToken = async (req, res, next) => {
+  try {
+    // Get the token
+    const token = req?.headers["authorization"]?.split(" ")[1];
+
+    // Check token
+    if (!token) {
+      return res
+        .status(403)
+        .json({ message: "Forbidden: unauthorized access" });
+    }
+
+    // Verify the token
+    const decoded = jwt.verify(token, process.env.PRIVATE_KEY);
+
+    req.user = decoded;
+
+    next();
+  } catch (error) {
+    console.error(error);
+    return res.status(401).json({ message: "unAuthorized access" });
+  }
+};
+
 // users related apis
 app.post("/log-in", async (req, res) => {
   try {
@@ -78,11 +108,18 @@ app.post("/log-in", async (req, res) => {
       return res.status(401).json({ message: "Invalid credentials" });
     }
 
+    const userData = {
+      name: user.name,
+      role: user.role,
+      email: user.email,
+      mobileNumber: user.mobileNumber,
+    };
     // JWT Token Provide
     const token = tokenGenerate(user);
     res.status(200).json({
       message: "Login successful",
       token: token,
+      data: userData,
     });
   } catch (error) {}
 });
@@ -95,7 +132,26 @@ app.post("/register", async (req, res) => {
     if (!name || !pin || !email || !nid || !mobileNumber || !role) {
       return res.status(400).json({ message: "All fields are required" });
     }
-
+    // check user
+    let isExist;
+    let message;
+    if (email || mobileNumber) {
+      if (email) {
+        isExist = await Users.findOne({ email });
+        if (isExist) message = "Email already save to database";
+      }
+      if (mobileNumber) {
+        isExist = await Users.findOne({ mobileNumber });
+        if (isExist) message = "Number already save to database";
+      }
+      if (nid) {
+        isExist = await Users.findOne({ nid });
+        if (isExist) message = "NID already save to database";
+      }
+    }
+    if (isExist) {
+      return res.status(200).json({ message });
+    }
     // password hash
     const saltRounds = +process.env.PASS_BCRYPT;
     const hashedPin = await bcrypt.hash(pin, saltRounds);
@@ -111,15 +167,39 @@ app.post("/register", async (req, res) => {
     };
     // save to db
     const result = await Users.insertOne(user);
-    console.log(result);
+
+    const userData = {
+      name: user.name,
+      role: user.role,
+      email: user.email,
+      mobileNumber: user.mobileNumber,
+    };
     // token
     const token = tokenGenerate(result);
-    res.status(201).json({ message: "User registered successfully", token });
+    res
+      .status(201)
+      .json({ message: "User registered successfully", token, data: userData });
   } catch (error) {
     res
       .status(500)
       .json({ message: "Internal server error", error: error.message });
     console.log("RegisterErr", error);
+  }
+});
+
+app.get("/role/:email", verifyToken, async (req, res) => {
+  try {
+    // console.log(req.user);
+    const email = req.params.email;
+    const result = await Users.findOne({ email });
+    const role = result.role;
+
+    res.json({ role });
+  } catch (error) {
+    console.log("role", error);
+    res
+      .status(500)
+      .json({ message: "Internal server error", error: error.message });
   }
 });
 
