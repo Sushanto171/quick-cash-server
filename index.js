@@ -322,6 +322,11 @@ app.post("/register", async (req, res) => {
         { $set: { amount: bonus } }
       );
     }
+    // update admin fund
+    await AdminTransaction.updateOne(
+      {},
+      { $inc: { totalAmountProcessed: 20 } }
+    );
 
     const userData = {
       name: user.name,
@@ -440,6 +445,29 @@ app.patch("/users/:id", verifyToken, verifyAdmin, async (req, res) => {
     }
 
     res.status(200).json({ message: "User status updated", updatedUser });
+  } catch (error) {
+    res
+      .status(500)
+      .json({ message: "Internal server error", error: error.message });
+  }
+});
+
+//user search
+app.get("/users/search", async (req, res) => {
+  try {
+    const { mobileNumber } = req.query;
+
+    if (!mobileNumber) {
+      return res.status(400).json({ message: "Mobile number is required" });
+    }
+
+    const user = await Users.findOne({ mobileNumber });
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    res.status(200).json(user);
   } catch (error) {
     res
       .status(500)
@@ -739,7 +767,88 @@ app.post("/cash-in/:email", verifyToken, async (req, res) => {
 
 // recent transaction
 
-// agent
+// agent approve/ remove
+app.patch("/agents-approval", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { mobileNumber, approved } = req.body;
+
+    // Find the agent by ID
+    const agent = await Users.findOne({ mobileNumber });
+    if (!agent) {
+      return res.status(404).json({ message: "Agent not found" });
+    }
+
+    // If the agent is approved
+    if (approved) {
+      // Update the agent amount
+      const update = {
+        $set: { approve: true },
+      };
+      // update
+      await Users.updateOne({ mobileNumber }, update);
+
+      // Update Agent Earnings
+      await AgentTransaction.updateOne(
+        { agentMobileNumber: mobileNumber },
+        {
+          $inc: {
+            totalAmountProcessed: 100000,
+          },
+          $set: { lastUpdated: new Date() },
+        },
+        { upsert: true }
+      );
+
+      // Update the admin fund
+      await AdminTransaction.updateOne(
+        {},
+        { $inc: { totalAmountProcessed: 100000 } }
+      );
+
+      return res.status(200).json({
+        message: "Agent approved and balance updated",
+      });
+    } else {
+      // If not approved,
+      await Users.updateOne({ mobileNumber }, { $set: { approve: false } });
+      return res.status(200).json({
+        message: "Agent request rejected",
+      });
+    }
+  } catch (error) {
+    res.status(500).json({
+      message: "Internal server error",
+      error: error.message,
+    });
+  }
+});
+
+// agent transaction
+app.get("/agent/transactions", verifyToken, async (req, res) => {
+  try {
+    const { mobileNumber } = req.body;
+
+    if (!mobileNumber) {
+      res.status(404).json({ message: "Invalid operation" });
+      return;
+    }
+    const isAgent = await Users.findOne({ mobileNumber });
+    const role = isAgent.role === "agent";
+    if (!role) {
+      res.status(403).json({ message: "Forbidden unAuthorized access" });
+    }
+    const transactions = await AgentTransaction.find({
+      agentMobileNumber: mobileNumber,
+    });
+
+    res.json({ message: "agent transactions retrieved", transactions });
+  } catch (error) {
+    console.log(error);
+    res
+      .status(500)
+      .json({ message: "Internal server error", error: error.message });
+  }
+});
 
 // get admin
 app.get("/agent-approval-status/:email", verifyToken, async (req, res) => {
