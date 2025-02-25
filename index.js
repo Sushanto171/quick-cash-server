@@ -43,7 +43,8 @@ const userSchema = new mongoose.Schema(
     nid: { type: String, require: true, unique: true }, //Unique
     role: { type: String, enum: ["user", "agent", "admin"], default: "user" },
     amount: { type: Number, default: 0 },
-    status: { type: Boolean, default: false },
+    status: { type: Boolean, default: false }, //if admin action block
+    approve: { type: Boolean, default: false }, // agent approval
   },
   { timestamps: true }
 );
@@ -229,6 +230,26 @@ const verifyPin = async (pin, email = null, mobileNumber = null) => {
   return user;
 };
 
+//
+const verifyAdmin = async (req, res, next) => {
+  try {
+    const { email } = req.user;
+
+    const result = await Users.findOne({ email });
+    const role = result?.role === "admin";
+    if (!role) {
+      return res
+        .status(403)
+        .json({ message: "Forbidden: unAuthorized access" });
+    }
+
+    next();
+  } catch (error) {
+    res
+      .status(500)
+      .json({ message: "Internal server error", error: error.message });
+  }
+};
 // auth related apis
 app.post("/log-in", async (req, res) => {
   try {
@@ -269,57 +290,50 @@ app.post("/register", async (req, res) => {
     if (!name || !pin || !email || !nid || !mobileNumber || !role) {
       return res.status(400).json({ message: "All fields are required" });
     }
-    // check user
-    let isExist;
-    let message;
-    if (email || mobileNumber) {
-      if (email) {
-        isExist = await Users.findOne({ email });
-        if (isExist) message = "Email already save to database";
-      }
-      if (mobileNumber) {
-        isExist = await Users.findOne({ mobileNumber });
-        if (isExist) message = "Number already save to database";
-      }
-      if (nid) {
-        isExist = await Users.findOne({ nid });
-        if (isExist) message = "NID already save to database";
-      }
-    }
+
+    // Check if email, mobile, or nid already exist
+    let isExist = await Users.findOne({
+      $or: [{ email }, { mobileNumber }, { nid }],
+    });
+
     if (isExist) {
+      let message;
+      if (isExist.email === email) message = "Email already save to database";
+      if (isExist.mobileNumber === mobileNumber)
+        message = "Number already save to database";
+      if (isExist.nid === nid) message = "NID already save to database";
       return res.status(200).json({ message });
     }
-    // password hash
-    const saltRounds = +process.env.PASS_BCRYPT;
+
+    // Password hash
+    const saltRounds = +process.env.PASS_BCRYPT || 10; // Fallback to 10 if not set
     const hashedPin = await bcrypt.hash(pin, saltRounds);
 
-    // user data
-    const user = {
-      name,
-      hashedPin,
-      email,
-      mobileNumber,
-      nid,
-      role,
-    };
-    // save to db
+    // User data
+    const user = { name, hashedPin, email, mobileNumber, nid, role };
     const result = await Users.insertOne(user);
 
-    // bonus 40tk
-    let bonus;
+    // Bonus allocation for users
+    let bonus = 0;
     if (result?._id && result?.role === "user") {
-      const email = result.email;
-      bonus = await Users.updateOne({ email }, { $set: { amount: 40 } });
+      bonus = 40;
+      await Users.updateOne(
+        { email: result.email },
+        { $set: { amount: bonus } }
+      );
     }
+
     const userData = {
       name: user.name,
       role: user.role,
       email: user.email,
       mobileNumber: user.mobileNumber,
-      amount: bonus ? 40 : result.amount,
+      amount: bonus,
     };
-    // token
+
+    // Generate token
     const token = tokenGenerate(result);
+
     res.status(201).json({
       message: "User registered successfully",
       token,
@@ -327,10 +341,10 @@ app.post("/register", async (req, res) => {
       bonus,
     });
   } catch (error) {
+    console.error("RegisterErr", error);
     res
       .status(500)
       .json({ message: "Internal server error", error: error.message });
-    console.log("RegisterErr", error);
   }
 });
 
@@ -348,6 +362,7 @@ app.get("/users", verifyToken, async (req, res) => {
           mobileNumber: 1,
           amount: 1,
           status: 1,
+          approve: 1,
         },
       },
     ]);
@@ -408,8 +423,32 @@ app.get("/role/:email", verifyToken, async (req, res) => {
   }
 });
 
-// send many apis
-app.post("/send-many/:email", verifyToken, async (req, res) => {
+//user block by admin
+app.patch("/users/:id", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+
+    const updatedUser = await Users.findByIdAndUpdate(
+      id,
+      { status },
+      { new: true }
+    );
+
+    if (!updatedUser) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    res.status(200).json({ message: "User status updated", updatedUser });
+  } catch (error) {
+    res
+      .status(500)
+      .json({ message: "Internal server error", error: error.message });
+  }
+});
+
+// send mane user
+app.post("/send-maney/:email", verifyToken, async (req, res) => {
   try {
     const user = req.user;
     const email = req.params.email;
@@ -501,7 +540,7 @@ app.post("/send-many/:email", verifyToken, async (req, res) => {
   }
 });
 
-// cash-out
+// cash-out user to agent
 app.post("/cash-out/:email", verifyToken, async (req, res) => {
   try {
     const user = req.user;
@@ -593,7 +632,7 @@ app.post("/cash-out/:email", verifyToken, async (req, res) => {
 
     // Prepare response data
     const data = {
-      transactionId: transaction._id,
+      transactionId: transaction.transaction,
       status: updatedStatus,
       totalAmount: transaction.totalAmount,
       cost: adminEarn + agentEarn,
@@ -607,48 +646,91 @@ app.post("/cash-out/:email", verifyToken, async (req, res) => {
   }
 });
 
-// cash in
-app.post("/cash-in", verifyToken, async (req, res) => {
+// cash in agent to user
+app.post("/cash-in/:email", verifyToken, async (req, res) => {
   try {
-    const { email, amount, transactionId } = req.body;
+    const user = req.user;
+    const email = req.params.email;
 
-    // Validate input
-    if (!email || !amount || amount < 50) {
+    if (email !== user.email) {
       return res
-        .status(400)
-        .json({ message: "Invalid amount. Minimum 50 BDT required!" });
+        .status(403)
+        .json({ message: "Forbidden: Unauthorized access" });
     }
 
-    // Check if user exists
-    const user = await usersCollection.findOne({ email });
-    if (!user) {
-      return res.status(404).json({ message: "User not found!" });
+    const { pin, mobileNumber, totalAmount, receiverMobileNumber } = req.body;
+
+    // Verify user PIN
+    const isUser = await verifyPin(pin, null, mobileNumber);
+    console.log(isUser);
+    if (!isUser) {
+      return res.status(400).json({ message: "Invalid credential" });
+    }
+    if (!totalAmount) {
+      return res.status(400).json({ message: "Invalid transaction data" });
     }
 
-    // Insert cash-in transaction
-    const transaction = {
-      email,
-      transactionId,
-      type: "cashin",
-      amount: Number(amount),
-      timestamp: new Date().toISOString(),
-      status: "success",
-    };
-    await transactionsCollection.insertOne(transaction);
+    // Insert Transaction
+    const transaction = await Transaction.create({
+      ...req.body,
+      status: "unsent",
+      createdAt: new Date(),
+    });
 
-    // Update user's balance
-    const newBalance = user.balance + Number(amount);
-    await usersCollection.updateOne(
-      { email },
-      { $set: { balance: newBalance } }
+    if (!transaction) {
+      return res.status(500).json({ message: "Failed to process transaction" });
+    }
+
+    // Update Transaction Status
+    let updatedStatus = "failed";
+    const isTransaction = await Transaction.findById(transaction._id);
+
+    if (isTransaction) {
+      const updateResult = await Transaction.updateOne(
+        { _id: isTransaction._id },
+        { $set: { status: "sent" } }
+      );
+      if (updateResult.modifiedCount > 0) {
+        updatedStatus = "sent";
+      }
+    }
+
+    // Update Admin Earnings (No fees, so just tracking total transactions)
+    await AdminTransaction.updateOne(
+      {},
+      {
+        $inc: {
+          totalTransactions: 1,
+          totalAmountProcessed: Number(totalAmount),
+        },
+        $set: { lastUpdated: new Date() },
+      },
+      { upsert: true }
     );
 
-    // Response
-    res.status(200).json({
-      message: "Cash In Successful!",
-      transactionId,
-      newBalance,
-    });
+    // Update Agent Earnings (No commission, only tracking transactions)
+    await AgentTransaction.updateOne(
+      { agentMobileNumber: receiverMobileNumber },
+      {
+        $inc: { totalTransactions: 1, totalAmountProcessed: +totalAmount },
+        $set: { lastUpdated: new Date() },
+      },
+      { upsert: true }
+    );
+
+    // Update User Balance (Adding total amount to user's account)
+    await Users.updateOne({ email }, { $inc: { amount: +totalAmount } });
+
+    // Prepare response data
+    const data = {
+      transactionId: transaction._id,
+      status: updatedStatus,
+      totalAmount: transaction.totalAmount,
+      cost: 0, // No fee or cost
+      timestamp: transaction.createdAt,
+    };
+
+    res.status(200).json({ message: "Cash In Successful", data });
   } catch (error) {
     console.error("Cash In Error:", error);
     res.status(500).json({ message: "Internal Server Error!" });
@@ -656,6 +738,48 @@ app.post("/cash-in", verifyToken, async (req, res) => {
 });
 
 // recent transaction
+
+// agent
+
+// get admin
+app.get("/agent-approval-status/:email", verifyToken, async (req, res) => {
+  try {
+    const user = req.user;
+    const email = req.params.email;
+
+    if (email !== user.email) {
+      return res
+        .status(403)
+        .json({ message: "Forbidden: Unauthorized access" });
+    }
+
+    const result = await Users.findOne({ email });
+    const isAgent = result.approve;
+    res.status(200).json({ data: isAgent });
+  } catch (error) {
+    res
+      .status(500)
+      .json({ message: "Internal server error", error: error.message });
+  }
+});
+
+app.get(
+  "/admin/transactions/:email",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const transactions = await AdminTransaction.find({});
+
+      res.json({ message: "Admin transactions retrieved", transactions });
+    } catch (error) {
+      console.log(error);
+      res
+        .status(500)
+        .json({ message: "Internal server error", error: error.message });
+    }
+  }
+);
 
 app.get("/", (req, res) => {
   res.send("Quick cash server on running.....");
