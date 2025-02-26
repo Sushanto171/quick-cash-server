@@ -45,6 +45,7 @@ const userSchema = new mongoose.Schema(
     amount: { type: Number, default: 0 },
     status: { type: Boolean, default: false }, //if admin action block
     approve: { type: Boolean, default: false }, // agent approval
+    deviceId: { type: String },
   },
   { timestamps: true }
 );
@@ -80,6 +81,9 @@ const agentTransactionSchema = new mongoose.Schema({
     type: String,
     required: true,
     unique: true,
+  },
+  name: {
+    type: String,
   },
   totalTransactions: {
     type: Number,
@@ -144,7 +148,6 @@ const transactionSchema = new mongoose.Schema({
   },
   sendMoneyFee: {
     type: Number,
-    required: true,
   },
   status: {
     type: String,
@@ -180,7 +183,7 @@ const tokenGenerate = (user) => {
     role: user.role,
     email: user.email,
   };
-  const token = jwt.sign(payload, privateKey, { expiresIn: "30min" });
+  const token = jwt.sign(payload, privateKey, { expiresIn: "7d" });
   return token;
 };
 
@@ -189,7 +192,7 @@ const verifyToken = async (req, res, next) => {
   try {
     // Get the token
     const token = req?.headers["authorization"]?.split(" ")[1];
-
+    const deviceId = req?.headers["x-device-id"]; // come to client side
     // Check token
     if (!token) {
       return res
@@ -200,6 +203,12 @@ const verifyToken = async (req, res, next) => {
     // Verify the token
     const decoded = jwt.verify(token, process.env.PRIVATE_KEY);
 
+    const user = await Users.findOne({ email: decoded.email });
+    if (user.deviceId == !deviceId) {
+      return res
+        .status(401)
+        .json({ message: "Logged in from another device!" });
+    }
     req.user = decoded;
     next();
   } catch (error) {
@@ -253,7 +262,7 @@ const verifyAdmin = async (req, res, next) => {
 // auth related apis
 app.post("/log-in", async (req, res) => {
   try {
-    const { mobileNumber, email, pin } = req.body;
+    const { mobileNumber, email, pin, deviceId } = req.body;
     // Check if any field is missing
     if (!pin) {
       return res.status(400).json({ message: "All fields are required" });
@@ -265,6 +274,11 @@ app.post("/log-in", async (req, res) => {
       return res.status(401).json({ message: "Invalid credentials" });
     }
 
+    // save device  id
+    await Users.updateOne(
+      { email: user.email },
+      { $set: { deviceId: deviceId } }
+    );
     const userData = {
       name: user.name,
       role: user.role,
@@ -315,13 +329,14 @@ app.post("/register", async (req, res) => {
 
     // Bonus allocation for users
     let bonus = 0;
-    if (result?._id && result?.role === "user") {
+    if (result?._id && result.role === "user") {
       bonus = 40;
       await Users.updateOne(
         { email: result.email },
         { $set: { amount: bonus } }
       );
     }
+
     // update admin fund
     await AdminTransaction.updateOne(
       {},
@@ -350,6 +365,27 @@ app.post("/register", async (req, res) => {
     res
       .status(500)
       .json({ message: "Internal server error", error: error.message });
+  }
+});
+
+//
+app.get("/auth/me", async (req, res) => {
+  const token = req.headers.authorization?.split(" ")[1];
+  if (!token) return res.status(401).json({ error: "Unauthorized" });
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const user = await User.findOne({ email: decoded.email });
+
+    if (!user || user.token !== token) {
+      return res
+        .status(401)
+        .json({ error: "Invalid token or logged in from another device" });
+    }
+
+    res.json({ user: { email: user.email } });
+  } catch {
+    res.status(401).json({ error: "Invalid token" });
   }
 });
 
@@ -453,15 +489,17 @@ app.patch("/users/:id", verifyToken, verifyAdmin, async (req, res) => {
 });
 
 //user search
-app.get("/users/search", async (req, res) => {
+app.get("/users/search?", async (req, res) => {
   try {
-    const { mobileNumber } = req.query;
-
+    const { query: mobileNumber } = req.query;
+    console.log(mobileNumber);
     if (!mobileNumber) {
       return res.status(400).json({ message: "Mobile number is required" });
     }
 
-    const user = await Users.findOne({ mobileNumber });
+    const user = await Users.find({
+      mobileNumber: { $regex: new RegExp(mobileNumber, "i") },
+    });
 
     if (!user) {
       return res.status(404).json({ message: "User not found" });
@@ -472,6 +510,41 @@ app.get("/users/search", async (req, res) => {
     res
       .status(500)
       .json({ message: "Internal server error", error: error.message });
+  }
+});
+
+// get user by transaction by user mobile number
+app.get("/user-transaction/:mobileNumber?", verifyToken, async (req, res) => {
+  try {
+    const { mobileNumber } = req.params;
+    const { limit } = req.query;
+
+    const transactions = await Transaction.find({
+      $or: [
+        {
+          senderMobileNumber: {
+            $regex: new RegExp(`^${mobileNumber}$`, "i"),
+          },
+        },
+        {
+          mobileNumber: { $regex: new RegExp(`^${mobileNumber}$`, "i") },
+        },
+        {
+          receiverMobileNumber: {
+            $regex: new RegExp(`^${mobileNumber}$`, "i"),
+          },
+        },
+      ],
+    })
+      .sort({ createdAt: -1 })
+      .limit(limit === "100" ? 100 : "");
+
+    res.status(200).json({ transactions });
+  } catch (error) {
+    res.status(500).json({
+      message: "Internal server error",
+      error: error.message,
+    });
   }
 });
 
@@ -592,7 +665,8 @@ app.post("/cash-out/:email", verifyToken, async (req, res) => {
       return res.status(400).json({ message: "Invalid credential" });
     }
 
-    const { totalAmount, finalAmount, receiverMobileNumber } = cashOutData;
+    const { totalAmount, finalAmount, receiverMobileNumber, receiverName } =
+      cashOutData;
     if (!totalAmount || !finalAmount) {
       return res.status(400).json({ message: "Invalid transaction data" });
     }
@@ -640,8 +714,9 @@ app.post("/cash-out/:email", verifyToken, async (req, res) => {
     );
 
     // Update Agent Earnings
-    await AgentTransaction.updateOne(
+    const show = await AgentTransaction.updateOne(
       { agentMobileNumber: receiverMobileNumber },
+
       {
         $inc: {
           totalTransactions: 1,
@@ -649,7 +724,10 @@ app.post("/cash-out/:email", verifyToken, async (req, res) => {
           totalCommissionEarned: agentEarn,
           totalCashIn: parseInt(totalAmount),
         },
-        $set: { lastUpdated: new Date() },
+        $set: {
+          name: receiverName,
+          lastUpdated: new Date(),
+        },
       },
       { upsert: true }
     );
@@ -686,11 +764,17 @@ app.post("/cash-in/:email", verifyToken, async (req, res) => {
         .json({ message: "Forbidden: Unauthorized access" });
     }
 
-    const { pin, mobileNumber, totalAmount, receiverMobileNumber } = req.body;
+    const {
+      pin,
+      mobileNumber,
+      totalAmount,
+      receiverMobileNumber,
+      receiverName,
+    } = req.body;
 
     // Verify user PIN
     const isUser = await verifyPin(pin, null, mobileNumber);
-    console.log(isUser);
+
     if (!isUser) {
       return res.status(400).json({ message: "Invalid credential" });
     }
@@ -739,9 +823,10 @@ app.post("/cash-in/:email", verifyToken, async (req, res) => {
     // Update Agent Earnings (No commission, only tracking transactions)
     await AgentTransaction.updateOne(
       { agentMobileNumber: receiverMobileNumber },
+
       {
-        $inc: { totalTransactions: 1, totalAmountProcessed: +totalAmount },
-        $set: { lastUpdated: new Date() },
+        $inc: { totalTransactions: 1, totalAmountProcessed: -totalAmount },
+        $set: { lastUpdated: new Date(), name: receiverName },
       },
       { upsert: true }
     );
@@ -765,12 +850,10 @@ app.post("/cash-in/:email", verifyToken, async (req, res) => {
   }
 });
 
-// recent transaction
-
 // agent approve/ remove
 app.patch("/agents-approval", verifyToken, verifyAdmin, async (req, res) => {
   try {
-    const { mobileNumber, approved } = req.body;
+    const { mobileNumber, approved, name } = req.body;
 
     // Find the agent by ID
     const agent = await Users.findOne({ mobileNumber });
@@ -790,11 +873,12 @@ app.patch("/agents-approval", verifyToken, verifyAdmin, async (req, res) => {
       // Update Agent Earnings
       await AgentTransaction.updateOne(
         { agentMobileNumber: mobileNumber },
+
         {
           $inc: {
             totalAmountProcessed: 100000,
           },
-          $set: { lastUpdated: new Date() },
+          $set: { lastUpdated: new Date(), name: name },
         },
         { upsert: true }
       );
@@ -802,7 +886,8 @@ app.patch("/agents-approval", verifyToken, verifyAdmin, async (req, res) => {
       // Update the admin fund
       await AdminTransaction.updateOne(
         {},
-        { $inc: { totalAmountProcessed: 100000 } }
+        { $inc: { totalAmountProcessed: 100000 } },
+        { upsert: true }
       );
 
       return res.status(200).json({
@@ -824,9 +909,9 @@ app.patch("/agents-approval", verifyToken, verifyAdmin, async (req, res) => {
 });
 
 // agent transaction
-app.get("/agent/transactions", verifyToken, async (req, res) => {
+app.get("/agent/transactions/:mobileNumber", verifyToken, async (req, res) => {
   try {
-    const { mobileNumber } = req.body;
+    const mobileNumber = req.params.mobileNumber;
 
     if (!mobileNumber) {
       res.status(404).json({ message: "Invalid operation" });
@@ -850,6 +935,19 @@ app.get("/agent/transactions", verifyToken, async (req, res) => {
   }
 });
 
+//
+app.get("/agent/transactions", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const transactions = await AgentTransaction.find({});
+
+    res.json({ message: "agent transactions retrieved", transactions });
+  } catch (error) {
+    console.log(error);
+    res
+      .status(500)
+      .json({ message: "Internal server error", error: error.message });
+  }
+});
 // get admin
 app.get("/agent-approval-status/:email", verifyToken, async (req, res) => {
   try {
