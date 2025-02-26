@@ -4,19 +4,33 @@ const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
+const bodyParser = require("body-parser");
 const app = express();
-
+const { Server } = require("socket.io");
+const { createServer } = require("node:http");
+const server = createServer(app);
+const io = new Server(server);
 const port = process.env.PROT || 5000;
 
 // middleware
-app.use(
-  cors({
-    origin: ["http://localhost:5173", "https://quick-cash-1.netlify.app"],
-    credentials: true,
-  })
-);
-app.use(express.json());
+const corsOptions = {
+  origin: ["*"],
+  methods: ["GET", "POST", "PATCH", "PUT", "DELETE"],
+  credentials: true,
+};
 
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  next();
+});
+
+// Apply CORS Middleware
+app.use(cors(corsOptions));
+
+app.use(express.json());
+app.use(bodyParser.json());
 // db connection
 async function main() {
   try {
@@ -752,7 +766,27 @@ app.post("/cash-out/:email", verifyToken, async (req, res) => {
   }
 });
 
+// real time notification
 // cash in agent to user
+
+io.on("connection", (socket) => {
+  console.log("User Connected:", socket.id);
+
+  socket.on("register", (mobileNumber) => {
+    userSockets[mobileNumber] = socket.id;
+  });
+  // Handle user disconnection
+  socket.on("disconnect", () => {
+    console.log("User Disconnected:", socket.id);
+    for (const number in userSockets) {
+      if (userSockets[number] === socket.id) {
+        delete userSockets[number];
+        break;
+      }
+    }
+  });
+});
+
 app.post("/cash-in/:email", verifyToken, async (req, res) => {
   try {
     const user = req.user;
@@ -833,7 +867,20 @@ app.post("/cash-in/:email", verifyToken, async (req, res) => {
 
     // Update User Balance (Adding total amount to user's account)
     await Users.updateOne({ email }, { $inc: { amount: +totalAmount } });
-
+    const notifyUser = await Users.findOne({
+      mobileNumber,
+    });
+    //  real time notification
+    if (notifyUser) {
+      const userSocketId = userSockets[mobileNumber];
+      if (userSocketId) {
+        io.to(userSocketId).emit("notification", {
+          message: `Cash in success ${totalAmount}৳ .`,
+          amount: totalAmount,
+          timestamp: new Date(),
+        });
+      }
+    }
     // Prepare response data
     const data = {
       transactionId: transaction._id,
@@ -991,6 +1038,6 @@ app.get(
 app.get("/", (req, res) => {
   res.send("Quick cash server on running.....");
 });
-app.listen(port, () => {
+server.listen(port, () => {
   console.log(`Quick cash server on running on : ${port}`);
 });
